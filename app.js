@@ -1,10 +1,9 @@
 (() => {
   'use strict';
 
-  const USER_HASH = '8504655fa1bac5cadf3d067e80f564f0979bb68ba23f55129b71285d3859677d';
-  const PASS_HASH = '931d96ff40cc386729eac3b27a8af57ae000e515e35a43849f3652eb53bca72f';
-  const SESSION_KEY = 'cartelera.session';
-  const STORAGE_KEY = 'cartelera.urls.v1';
+  const API_BASE = 'https://cartelera-api.consorcioweb.workers.dev';
+  const TOKEN_KEY = 'cartelera.token';
+  const EXPIRES_KEY = 'cartelera.expires';
   const STATUS_LABELS = { vista: 'Vista', 'no-vista': 'No vista' };
 
   const ICONS = {
@@ -41,61 +40,85 @@
     toast: $('#toast')
   };
 
-  let items = readItems();
+  let items = [];
   let editingId = null;
   let pendingDeleteId = null;
   let toastTimer = 0;
+  let loading = false;
+  let submitting = false;
 
-  function uid() {
-    return crypto.randomUUID
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  class ApiError extends Error {
+    constructor(message, status) {
+      super(message);
+      this.status = status;
+    }
   }
 
-  function sanitizeItem(raw) {
-    if (!raw || typeof raw !== 'object' || typeof raw.url !== 'string') return null;
-
-    let url;
-    try {
-      const parsed = new URL(raw.url);
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-      url = parsed.href;
-    } catch {
+  function getSessionToken() {
+    const token = sessionStorage.getItem(TOKEN_KEY);
+    const expiresAt = Number(sessionStorage.getItem(EXPIRES_KEY) || 0);
+    if (!token || !expiresAt || expiresAt <= Date.now()) {
+      clearSession();
       return null;
     }
-
-    return {
-      id: typeof raw.id === 'string' && raw.id ? raw.id : uid(),
-      url,
-      description: typeof raw.description === 'string' ? raw.description.slice(0, 160) : '',
-      status: raw.status === 'vista' ? 'vista' : 'no-vista',
-      createdAt: Number(raw.createdAt) || Date.now(),
-      updatedAt: Number(raw.updatedAt) || Date.now()
-    };
+    return token;
   }
 
-  function readItems() {
-    try {
-      const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-      if (!Array.isArray(stored)) return [];
-      return stored.map(sanitizeItem).filter(Boolean);
-    } catch {
-      return [];
+  function saveSession(token, expiresAt) {
+    sessionStorage.setItem(TOKEN_KEY, token);
+    sessionStorage.setItem(EXPIRES_KEY, String(expiresAt));
+  }
+
+  function clearSession() {
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(EXPIRES_KEY);
+  }
+
+  async function apiFetch(path, { method = 'GET', body, auth = true } = {}) {
+    const headers = {};
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+
+    if (auth) {
+      const token = getSessionToken();
+      if (!token) {
+        expireSession();
+        throw new ApiError('La sesión expiró. Ingresa de nuevo.', 401);
+      }
+      headers.Authorization = `Bearer ${token}`;
     }
-  }
 
-  function persist() {
+    let response;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+      response = await fetch(`${API_BASE}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
     } catch {
-      showToast('No se pudo guardar en este navegador');
+      throw new ApiError('No se pudo conectar con el servidor. Revisa tu conexión.', 0);
     }
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      if (response.status === 401 && auth) expireSession();
+      throw new ApiError(payload?.error || 'No se pudo completar la solicitud.', response.status);
+    }
+
+    return payload;
   }
 
-  async function sha256(value) {
-    const bytes = new TextEncoder().encode(value);
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  function expireSession() {
+    if (els.appView.hidden) return;
+    clearSession();
+    items = [];
+    setView(false);
+    showLoginError('La sesión expiró. Ingresa de nuevo.');
   }
 
   function setView(authenticated) {
@@ -103,13 +126,23 @@
     els.appView.hidden = !authenticated;
 
     if (authenticated) {
-      render();
-    } else {
-      resetForm();
       els.loginError.hidden = true;
       els.loginPass.value = '';
-      els.loginUser.focus();
+      loadItems();
+      return;
     }
+
+    loading = false;
+    clearSession();
+    items = [];
+    els.list.textContent = '';
+    els.stats.hidden = true;
+    els.emptyState.hidden = false;
+    els.emptyState.textContent = 'Aún no hay URLs en la lista. Agrega la primera arriba.';
+    resetForm();
+    els.loginError.hidden = true;
+    els.loginPass.value = '';
+    els.loginUser.focus();
   }
 
   function showLoginError(message) {
@@ -117,32 +150,66 @@
     els.loginError.hidden = false;
   }
 
+  async function loadItems() {
+    loading = true;
+    els.list.textContent = '';
+    els.stats.hidden = true;
+    els.emptyState.hidden = false;
+    els.emptyState.textContent = 'Cargando URLs…';
+    syncFormUi();
+
+    try {
+      const data = await apiFetch('/api/urls');
+      items = Array.isArray(data?.items) ? data.items.map(normalizeItem) : [];
+      loading = false;
+      els.emptyState.textContent = 'Aún no hay URLs en la lista. Agrega la primera arriba.';
+      syncFormUi();
+      render();
+    } catch (error) {
+      loading = false;
+      syncFormUi();
+      if (error.status === 401) return;
+      els.emptyState.hidden = false;
+      els.emptyState.textContent = 'No se pudieron cargar las URLs. Revisa la conexión y recarga la página.';
+      els.stats.hidden = true;
+      showToast(error.message);
+    }
+  }
+
   els.loginForm.addEventListener('submit', async (event) => {
     event.preventDefault();
+    if (submitting) return;
+
+    const submitButton = els.loginForm.querySelector('button[type="submit"]');
+    const originalLabel = submitButton.textContent;
     els.loginError.hidden = true;
+    submitting = true;
+    submitButton.disabled = true;
+    submitButton.textContent = 'Ingresando…';
 
-    let match = false;
     try {
-      const [userHash, passHash] = await Promise.all([
-        sha256(els.loginUser.value),
-        sha256(els.loginPass.value)
-      ]);
-      match = userHash === USER_HASH && passHash === PASS_HASH;
-    } catch {
-      showLoginError('No se pudo verificar el acceso en este navegador.');
-      return;
-    }
+      const data = await apiFetch('/api/login', {
+        method: 'POST',
+        auth: false,
+        body: {
+          username: els.loginUser.value,
+          password: els.loginPass.value
+        }
+      });
 
-    if (!match) {
-      showLoginError('Usuario o clave incorrectos.');
+      saveSession(data.token, Number(data.expiresAt) || Date.now() + 12 * 60 * 60 * 1000);
+      els.loginForm.reset();
+      setView(true);
+    } catch (error) {
+      if (error.status === 401) showLoginError('Usuario o clave incorrectos.');
+      else showLoginError(error.message);
       els.loginPass.value = '';
       els.loginPass.focus();
-      return;
+    } finally {
+      submitting = false;
+      submitButton.disabled = false;
+      submitButton.textContent = originalLabel;
     }
-
-    sessionStorage.setItem(SESSION_KEY, '1');
-    els.loginForm.reset();
-    setView(true);
   });
 
   els.togglePass.addEventListener('click', () => {
@@ -156,7 +223,7 @@
   });
 
   els.logoutBtn.addEventListener('click', () => {
-    sessionStorage.removeItem(SESSION_KEY);
+    clearSession();
     setView(false);
   });
 
@@ -176,6 +243,15 @@
     return parsed.href;
   }
 
+  function normalizeItem(raw) {
+    return {
+      id: String(raw?.id ?? ''),
+      url: String(raw?.url ?? ''),
+      description: typeof raw?.description === 'string' ? raw.description : '',
+      status: raw?.status === 'vista' ? 'vista' : 'no-vista'
+    };
+  }
+
   function prettyUrl(url) {
     return url.replace(/^https?:\/\//i, '').replace(/\/$/, '');
   }
@@ -183,12 +259,24 @@
   function resetForm() {
     editingId = null;
     els.form.reset();
-    els.formTitle.textContent = 'Agregar URL';
-    els.submitBtn.textContent = 'Agregar';
-    els.cancelEditBtn.hidden = true;
-    els.formPanel.classList.remove('is-editing');
     els.formError.hidden = true;
     els.formError.textContent = '';
+    syncFormUi();
+  }
+
+  function syncFormUi() {
+    els.formTitle.textContent = editingId ? 'Modificar URL' : 'Agregar URL';
+    els.submitBtn.textContent = editingId ? 'Guardar cambios' : 'Agregar';
+    els.cancelEditBtn.hidden = !editingId;
+    els.formPanel.classList.toggle('is-editing', Boolean(editingId));
+    els.submitBtn.disabled = submitting || loading;
+    els.cancelEditBtn.disabled = submitting;
+  }
+
+  function setSubmitting(busy) {
+    submitting = busy;
+    syncFormUi();
+    if (busy) els.submitBtn.textContent = editingId ? 'Guardando…' : 'Agregando…';
   }
 
   function startEdit(item) {
@@ -199,27 +287,29 @@
     const radio = els.form.querySelector(`input[name="status"][value="${item.status}"]`);
     if (radio) radio.checked = true;
 
-    els.formTitle.textContent = 'Modificar URL';
-    els.submitBtn.textContent = 'Guardar cambios';
-    els.cancelEditBtn.hidden = false;
-    els.formPanel.classList.add('is-editing');
     els.formError.hidden = true;
-
+    syncFormUi();
     render();
     els.formPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
     els.urlInput.focus({ preventScroll: true });
   }
 
   els.cancelEditBtn.addEventListener('click', () => {
+    if (submitting) return;
     resetForm();
     render();
     els.urlInput.focus();
   });
 
-  els.form.addEventListener('submit', (event) => {
+  els.form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    els.formError.hidden = true;
+    if (submitting) return;
+    if (loading) {
+      showToast('Cargando la lista. Intenta de nuevo en un momento.');
+      return;
+    }
 
+    els.formError.hidden = true;
     const url = normalizeUrl(els.urlInput.value);
     if (!url) {
       els.formError.textContent = 'Ingresa una URL válida (por ejemplo, https://ejemplo.com).';
@@ -230,36 +320,41 @@
 
     const description = els.descInput.value.trim();
     const status = els.form.elements.status.value === 'vista' ? 'vista' : 'no-vista';
-    const now = Date.now();
+    const wasEditing = Boolean(editingId);
+    const targetId = editingId;
 
-    if (editingId) {
-      const item = items.find((entry) => entry.id === editingId);
-      if (item) {
-        item.url = url;
-        item.description = description;
-        item.status = status;
-        item.updatedAt = now;
-        persist();
+    setSubmitting(true);
+
+    try {
+      if (wasEditing) {
+        const data = await apiFetch(`/api/urls/${encodeURIComponent(targetId)}`, {
+          method: 'PUT',
+          body: { url, description, status }
+        });
+        const index = items.findIndex((entry) => entry.id === targetId);
+        if (index !== -1) items[index] = normalizeItem(data.item);
         resetForm();
         render();
         showToast('Cambios guardados');
-        return;
+      } else {
+        const data = await apiFetch('/api/urls', {
+          method: 'POST',
+          body: { url, description, status }
+        });
+        items.unshift(normalizeItem(data.item));
+        resetForm();
+        render();
+        els.urlInput.focus();
+        showToast('URL agregada');
       }
+    } catch (error) {
+      if (error.status !== 401) {
+        els.formError.textContent = error.message;
+        els.formError.hidden = false;
+      }
+    } finally {
+      setSubmitting(false);
     }
-
-    items.unshift({
-      id: uid(),
-      url,
-      description,
-      status,
-      createdAt: now,
-      updatedAt: now
-    });
-    persist();
-    resetForm();
-    render();
-    els.urlInput.focus();
-    showToast('URL agregada');
   });
 
   function askDelete(item) {
@@ -269,7 +364,7 @@
     els.confirmDialog.showModal();
   }
 
-  els.confirmDialog.addEventListener('close', () => {
+  els.confirmDialog.addEventListener('close', async () => {
     const id = pendingDeleteId;
     const confirmed = els.confirmDialog.returnValue === 'confirm';
     pendingDeleteId = null;
@@ -277,11 +372,15 @@
 
     if (!id || !confirmed) return;
 
-    items = items.filter((item) => item.id !== id);
-    persist();
-    if (editingId === id) resetForm();
-    render();
-    showToast('URL eliminada');
+    try {
+      await apiFetch(`/api/urls/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      items = items.filter((item) => item.id !== id);
+      if (editingId === id) resetForm();
+      render();
+      showToast('URL eliminada');
+    } catch (error) {
+      if (error.status !== 401) showToast(error.message);
+    }
   });
 
   els.list.addEventListener('click', (event) => {
@@ -364,10 +463,12 @@
     const total = items.length;
     const vistas = items.filter((item) => item.status === 'vista').length;
 
-    els.emptyState.hidden = total > 0;
-    els.stats.hidden = total === 0;
+    if (!loading) {
+      els.emptyState.hidden = total > 0;
+    }
+    els.stats.hidden = total === 0 || loading;
 
-    if (total > 0) {
+    if (total > 0 && !loading) {
       els.stats.textContent = [
         plural(total, 'URL', 'URLs'),
         plural(vistas, 'vista', 'vistas'),
@@ -383,7 +484,7 @@
     toastTimer = setTimeout(() => els.toast.classList.remove('show'), 2400);
   }
 
-  if (sessionStorage.getItem(SESSION_KEY) === '1') {
+  if (getSessionToken()) {
     setView(true);
   } else {
     setView(false);

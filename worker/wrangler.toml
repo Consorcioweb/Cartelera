@@ -1,0 +1,8 @@
+name = "cartelera-api"
+main = "worker.js"
+compatibility_date = "2026-11-22"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cartelera-db"
+database_id = "f16557d3-325d-4096-82cd-ca9645567f67"

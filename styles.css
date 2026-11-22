@@ -75,6 +75,12 @@ body {
   transform: translateY(1px);
 }
 
+.btn:disabled {
+  opacity: .55;
+  cursor: default;
+  transform: none;
+}
+
 .btn-sm {
   padding: 8px 12px;
   font-size: 13px;

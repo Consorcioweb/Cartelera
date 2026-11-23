@@ -1,5 +1,7 @@
 const ALLOWED_ORIGINS = new Set([
   'https://consorcioweb.github.io',
+  'https://cine.generativa.space',
+  'http://cine.generativa.space',
   'http://localhost:5511',
   'http://127.0.0.1:5511'
 ]);
@@ -79,14 +81,14 @@ async function login(request, env, cors) {
   const body = await readJson(request);
   if (!body) return json({ error: 'Solicitud inválida' }, 400, cors);
 
-  const username = typeof body.username === 'string' ? body.username : '';
-  const password = typeof body.password === 'string' ? body.password : '';
+  const username = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
+  const password = typeof body.password === 'string' ? body.password.trim() : '';
   if (!username || !password) {
     return json({ error: 'Usuario y clave son obligatorios' }, 400, cors);
   }
 
   const [userOk, passOk] = await Promise.all([
-    constantTimeEqual(username, env.AUTH_USERNAME || ''),
+    constantTimeEqual(username, (env.AUTH_USERNAME || '').trim().toLowerCase()),
     verifyPassword(password, env)
   ]);
 
